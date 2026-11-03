@@ -32,6 +32,49 @@ func (p Provider) AccountServes(ref, model string) bool {
 	return own != model && slices.Contains(ms, own)
 }
 
+// seeingAccounts are the provider's accounts a test may go to, in the
+// gateway's order: the account the agent is signed in to (unless the user
+// paused it for the others on), then every other one switched on.
+func (p Provider) seeingAccounts() []Provider {
+	if p.Account == nil {
+		return []Provider{p}
+	}
+	var out []Provider
+	if len(p.AlsoOn()) == 0 || !p.OwnPaused() {
+		out = append(out, p)
+	}
+	return append(out, p.AlsoOn()...)
+}
+
+// AccountSeeing is p as the account of its accounts on that a test of model
+// goes to, chosen as the gateway's routing chooses one (gateway/fallback.go,
+// perKeyEvery): an account the user lets serve it (AccountServes) whose own
+// list has it (Account.Lists), else the first the user lets serve it, as the
+// gateway falls back to an account whose list leaves it out when none lists
+// it. A provider with no account, or with one, is left as it is; ok is false
+// when the user barred every account from the model. Without this a pool's
+// first account tested every account's models, and a model only another
+// account serves failed a test the gateway would have answered (#474).
+func (p Provider) AccountSeeing(model string) (Provider, bool) {
+	if p.Account == nil {
+		return p, true
+	}
+	var left []Provider
+	for _, q := range p.seeingAccounts() {
+		if q.Account == nil || !p.AccountServes(q.Account.User, model) {
+			continue
+		}
+		if q.Account.Lists(p.OwnModelID(model)) {
+			return q, true
+		}
+		left = append(left, q)
+	}
+	if len(left) > 0 {
+		return left[0], true
+	}
+	return p, false
+}
+
 // codexOwnHidden says model is one a Codex account serves that its list
 // of models can't name: codex-auto-review, the model Codex's auto-review
 // of an approval (the guardian) asks for. It is hidden from the

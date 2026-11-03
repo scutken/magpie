@@ -39,6 +39,34 @@ type Result struct {
 	otherAPI bool
 }
 
+// testSeeing is the account, key and model an endpoint's test goes with:
+// the first account with a model it lists to test on, and that account's
+// key for proto, as routing would pick them (#474). A provider with no
+// account is itself, as before.
+func (p Provider) testSeeing(proto Protocol) (Provider, string, bool) {
+	var first Provider
+	firstOK := false
+	for _, acct := range p.seeingAccounts() {
+		q, ok := acct.keyFor(proto)
+		if !ok {
+			continue
+		}
+		if model := acct.testModel(q, proto); model != "" {
+			return q, model, true
+		}
+		// an account with no model to test on the endpoint leaves it to
+		// the next one; the first is kept for what the caller says of an
+		// endpoint nothing is on (public Zen's free models, say)
+		if !firstOK {
+			first, firstOK = q, true
+		}
+	}
+	if firstOK {
+		return first, "", true
+	}
+	return p, "", false
+}
+
 // Test sends the smallest possible request to each endpoint the vendor
 // serves, signed with a key made for it and asking for a model that key
 // sees, and reports what came back.
@@ -51,8 +79,7 @@ func (p Provider) Test(ctx context.Context) []Result {
 	if client := testClient(ctx); client != "" {
 		// the one endpoint that agent's requests go to
 		proto := clientProto(client, p.Speaks())
-		q, ok := p.keyFor(proto)
-		model := p.testModel(q, proto)
+		q, model, ok := p.testSeeing(proto)
 		if why := p.TestsAs(client); why != "" {
 			return []Result{{Protocol: proto, Model: model, Error: why}}
 		}
@@ -63,14 +90,27 @@ func (p Provider) Test(ctx context.Context) []Result {
 			return []Result{{Protocol: proto, Error: zenPublicNone}}
 		}
 		url, body := tiny(q, proto, UpstreamName(p, model))
+		ctx = q.ownRequests(ctx, probelog.KindTest)
 		ctx, b := q.tested(ctx, url, asClient(client, proto, body))
 		return []Result{probe(ctx, q, proto, url, b, model, testWait)}
 	}
 	if p.isClaudeAccount() {
-		return []Result{p.testClaude(ctx, p.testModel(p, Anthropic))}
+		model := p.testModel(p, Anthropic)
+		if model != "" {
+			if a, ok := p.AccountSeeing(model); ok {
+				p = a
+			}
+		}
+		return []Result{p.testClaude(ctx, model)}
 	}
 	if p.testsTranslated() {
-		return []Result{p.testTranslated(ctx, p.testModel(p, CodeAssist))}
+		model := p.testModel(p, CodeAssist)
+		if model != "" {
+			if a, ok := p.AccountSeeing(model); ok {
+				p = a
+			}
+		}
+		return []Result{p.testTranslated(ctx, model)}
 	}
 	var out []Result
 	for _, proto := range p.Speaks() {
@@ -80,8 +120,7 @@ func (p Provider) Test(ctx context.Context) []Result {
 			// on Gemini, and such a model by its own test (TestModel)
 			continue
 		}
-		q, ok := p.keyFor(proto)
-		model := p.testModel(q, proto)
+		q, model, ok := p.testSeeing(proto)
 		if !ok {
 			out = append(out, Result{Protocol: proto, Model: model, Error: "no key is on for this endpoint"})
 			continue
@@ -92,6 +131,7 @@ func (p Provider) Test(ctx context.Context) []Result {
 			continue
 		}
 		url, body := tiny(q, proto, UpstreamName(p, model))
+		ctx = q.ownRequests(ctx, probelog.KindTest)
 		ctx, b := q.tested(ctx, url, body)
 		out = append(out, probe(ctx, q, proto, url, b, model, testWait))
 	}
@@ -407,6 +447,16 @@ func (p Provider) testOne(ctx context.Context, model string) Result {
 	if why := p.TestsAs(client); why != "" {
 		return Result{Protocol: clientProto(client, p.Speaks()), Model: model, Error: why}
 	}
+	// the account the gateway would send it to, not just the first of the
+	// pool: an account's own models (AccountModels) and its plan's list are
+	// the gateway's to keep too (#474)
+	acct, ok := p.AccountSeeing(model)
+	if !ok {
+		return Result{Model: model, Error: "no account that's on serves this model"}
+	}
+	p = acct
+	// the row says which account answered, as the gateway's rows do
+	ctx = p.ownRequests(ctx, probelog.KindTest)
 	if p.isClaudeAccount() {
 		return p.testClaude(ctx, model)
 	}
@@ -514,7 +564,8 @@ func (p Provider) testOne(ctx context.Context, model string) Result {
 }
 
 // keySeeing is p with the key a test of model on proto goes with: one made
-// for that API, else one made for any, that sees the model. A provider
+// for that API, else one made for any, that sees the model — and that the
+// user lets serve it (AccountModels, #474), as routing does. A provider
 // without keys is left as it is.
 func (p Provider) keySeeing(proto Protocol, model string) (Provider, bool) {
 	keys := p.KeysOn()
@@ -524,7 +575,7 @@ func (p Provider) keySeeing(proto Protocol, model string) (Provider, bool) {
 	serves := p.Serving(model)
 	for _, want := range []Protocol{proto, ""} {
 		for _, k := range keys {
-			if k.Protocol == want && serves(k) {
+			if k.Protocol == want && serves(k) && p.AccountServes(keyID(k.Key), model) {
 				return p.WithKey(k), true
 			}
 		}
@@ -608,7 +659,8 @@ func (p Provider) testModel(q Provider, proto Protocol) string {
 				if public && !p.OpenCodeFree(m.ID) {
 					continue
 				}
-				if !p.DecidesModel(m.ID) && !off(p.ID, m.ID) && want(m.ID) && (k.Key == "" || p.Serves(k, m.ID)) {
+				if !p.DecidesModel(m.ID) && !off(p.ID, m.ID) && want(m.ID) && (k.Key == "" || p.Serves(k, m.ID)) &&
+					(p.Account == nil || p.Account.Lists(m.ID) && p.AccountServes(p.Account.User, m.ID)) {
 					return m.ID
 				}
 			}
